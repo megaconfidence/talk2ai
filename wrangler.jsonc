@@ -8,12 +8,36 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2025-03-17",
 	"compatibility_flags": ["nodejs_compat"],
-	"migrations": [
-		{
-			"new_classes": ["MyDurableObject"],
-			"tag": "v1",
+	/**
+	 * Declarative Durable Object lifecycle. This replaces the legacy `migrations`
+	 * array (the two are mutually exclusive) specifically so this repo can be
+	 * deployed to a fresh account.
+	 *
+	 * The old array started with `new_classes: ["MyDurableObject"]`, which asks
+	 * for the key-value storage backend. Cloudflare no longer allows creating
+	 * key-value-backed namespaces on accounts that do not already have one, and
+	 * the Workers Free plan has never supported them — so a first-time deploy
+	 * would have failed on that step before reaching anything else.
+	 *
+	 * With `exports` there is no history to replay: only what is declared here
+	 * gets provisioned.
+	 */
+	"exports": {
+		/**
+		 * Tombstone retiring the pre-Agents-SDK class. Needed on the original
+		 * deployment, where that namespace still exists; on a fresh account it is
+		 * a no-op that logs a harmless `stale_tombstone` notice, which you can
+		 * silence by deleting this entry after your first deploy.
+		 */
+		"MyDurableObject": {
+			"state": "deleted",
+			"type": "durable-object",
 		},
-	],
+		"VoiceAgent": {
+			"storage": "sqlite",
+			"type": "durable-object",
+		},
+	},
 	"assets": {
 		"binding": "ASSETS",
 		"directory": "./public",
@@ -21,8 +45,8 @@
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "MyDurableObject",
-				"name": "MY_DURABLE_OBJECT",
+				"class_name": "VoiceAgent",
+				"name": "VoiceAgent",
 			},
 		],
 	},

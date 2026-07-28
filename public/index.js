@@ -1,98 +1,96 @@
-import { startVad } from './vad/index.js';
-import { base64ToArrBuff, queueSound, stopPlaying } from './utils.js';
-import arraybufferToAudiobuffer from 'https://cdn.jsdelivr.net/npm/arraybuffer-to-audiobuffer@0.0.5/+esm';
+import { VoiceClient } from 'https://cdn.jsdelivr.net/npm/@cloudflare/voice@0.3.5/client/+esm';
+import {
+	buttons,
+	clearMessages,
+	renderTranscript,
+	resetAudioLevel,
+	setAudioLevel,
+	setControls,
+	setInterim,
+	setStatus,
+	setVisualizerVisible,
+	showNotice,
+} from './ui.js';
 
-// app state
-window.socket = undefined;
-window.vadInitialized = false;
-window.thinkingTimeoutId = undefined;
-window.visualizationIntervalId = undefined;
+const { startButton, stopButton, clearChatButton } = buttons;
 
-window.connectWebSocket = function () {
-	if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-		console.log('WebSocket already open or connecting.');
-		return;
-	}
-	socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/websocket`);
-
-	socket.onopen = () => {
-		console.log('WebSocket connection established.');
-		setStatus(vadInitialized ? 'Listening...' : 'Ready to initialize VAD.');
-	};
-
-	socket.onmessage = async (event) => {
-		const data = JSON.parse(event.data);
-		switch (data.type) {
-			case 'audio': // ai's response
-				printSpeach(data.text, 'ai'); // displays text
-				queueSound(data.audio, setStatus); // plays audio
-				break;
-			case 'text': // user's transcribed speech
-				printSpeach(data.text, 'user'); // displays user text
-				break;
-			default:
-				console.warn('Unknown WebSocket message type:', data.type);
-				break;
-		}
-	};
-
-	socket.onerror = (error) => {
-		console.error('WebSocket Error:', error);
-		setStatus('Connection error. Try refreshing.');
-	};
-
-	socket.onclose = (event) => {
-		console.log('WebSocket connection closed:', event.reason);
-		if (conversationActive) {
-			setStatus('Connection lost. Please Stop and Start again.');
-		} else {
-			setStatus('Disconnected. Ready to connect.');
-		}
-	};
+const STATUS_LABEL = {
+	idle: 'Idle. Click Start to talk.',
+	listening: 'Listening...',
+	thinking: 'Thinking...',
+	speaking: 'AI speaking...',
 };
 
-window.printSpeach = function (msg, type = 'user') {
-	if (type === 'user') {
-		addMessage(msg, 'user');
-	} else {
-		addMessage(msg, 'ai');
-	}
-};
+/**
+ * `agent` matches the exported Durable Object class name in src/index.ts. The
+ * client kebab-cases it to build the WebSocket URL, so this must stay in sync
+ * with the `class_name` in wrangler.jsonc.
+ */
+const client = new VoiceClient({ agent: 'VoiceAgent' });
 
-window.initializeVADSystem = async function () {
-	if (vadInitialized) {
-		window.stream.getTracks().forEach((track) => {
-			if (track.readyState == 'live') track.enabled = true;
-		});
-		console.log('VAD already initialized.');
-		return true;
-	}
-	setStatus('Initializing VAD...');
+// The client keeps every message it has seen. "Clear" wipes server-side history
+// and moves this offset so the cleared turns stop being rendered.
+let clearOffset = 0;
+let connected = false;
+let inCall = false;
 
-	function onAudioBuffer(buff) {
-		if (socket && socket.readyState === WebSocket.OPEN) {
-			stopPlaying(); // stop any ai audio before sending user audio
-			socket.send(buff);
-		} else {
-			console.warn('WebSocket not open. Cannot send audio.');
-			setStatus('Connection issue. Cannot send audio.');
-		}
-	}
+function syncControls() {
+	setControls({ inCall, connected });
+}
 
-	function onVADStatus(msg) {
-		if (conversationActive) setStatus(`Listening: ${msg}`);
-	}
+client.addEventListener('connectionchange', (isConnected) => {
+	connected = isConnected;
+	if (!isConnected) setStatus('Reconnecting...');
+	else if (!inCall) setStatus(STATUS_LABEL.idle);
+	syncControls();
+});
 
+client.addEventListener('statuschange', (status) => {
+	inCall = status !== 'idle';
+	setStatus(STATUS_LABEL[status] ?? status);
+	setVisualizerVisible(inCall);
+	if (!inCall) resetAudioLevel();
+	syncControls();
+});
+
+client.addEventListener('transcriptchange', (messages) => {
+	renderTranscript(messages.slice(clearOffset));
+});
+
+client.addEventListener('interimtranscript', (text) => setInterim(text));
+
+client.addEventListener('audiolevelchange', (level) => {
+	if (inCall) setAudioLevel(level);
+});
+
+client.addEventListener('error', (message) => {
+	if (message) setStatus(`Error: ${message}`);
+});
+
+// Latency breakdown per turn — the hand-rolled pipeline had no visibility here.
+client.addEventListener('metricschange', (metrics) => {
+	if (metrics) console.log('[voice] metrics', metrics);
+});
+
+startButton.addEventListener('click', async () => {
 	try {
-		await startVad(onAudioBuffer, onVADStatus); // Initialize VAD
-		vadInitialized = true;
-		console.log('VAD initialized successfully.');
-		setStatus('Listening...');
-		return true;
+		await client.startCall();
 	} catch (error) {
-		console.error('Error initializing VAD:', error);
-		setStatus('VAD initialization failed.');
-		vadInitialized = false;
-		return false;
+		console.error('Failed to start call:', error);
+		setStatus('Could not access the microphone.');
 	}
-};
+});
+
+stopButton.addEventListener('click', () => client.endCall());
+
+clearChatButton.addEventListener('click', () => {
+	client.sendJSON({ type: 'clear' });
+	clearOffset = client.transcript.length;
+	clearMessages();
+	setInterim(null);
+	showNotice('Chat cleared. Click Start to begin.');
+});
+
+setStatus('Connecting...');
+syncControls();
+client.connect();

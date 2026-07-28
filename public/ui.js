@@ -1,181 +1,131 @@
-import { stopPlaying } from './utils.js';
-
-const stopButton = document.getElementById('stopButton');
 const statusText = document.getElementById('statusText');
 const startButton = document.getElementById('startButton');
-const messagesArea = document.getElementById('messagesArea');
+const stopButton = document.getElementById('stopButton');
 const clearChatButton = document.getElementById('clearChatButton');
+const messagesArea = document.getElementById('messagesArea');
 const voiceVisualizationArea = document.getElementById('voiceVisualizationArea');
 const voiceBars = Array.from(voiceVisualizationArea.querySelectorAll('.voice-bar'));
-
-window.conversationActive = false; // tracks if VAD and ws interaction is active
 
 const MIN_BAR_HEIGHT = 5;
 const MAX_BAR_HEIGHT_MOBILE = 30;
 const MAX_BAR_HEIGHT_DESKTOP = 40;
-let currentMaxBarHeight = MAX_BAR_HEIGHT_MOBILE;
-const INITIAL_MESSAGE = 'Hello! Click "Start" to begin.';
+// Speech RMS sits well below 1.0, so scale it up before mapping to pixels.
+const LEVEL_GAIN = 3;
+// Middle bars peak highest, which reads as an equaliser rather than a row of
+// identical blocks. Purely cosmetic — the input is a real measurement.
+const BAR_WEIGHTS = [0.55, 0.8, 1, 0.8, 0.55];
 
-window.setStatus = function (text) {
+let maxBarHeight = MAX_BAR_HEIGHT_MOBILE;
+
+export const buttons = { startButton, stopButton, clearChatButton };
+
+export function setStatus(text) {
 	statusText.textContent = text;
-};
+}
 
-window.updateButtonText = function () {
+export function updateButtonText() {
 	const isMobile = window.innerWidth < 640;
 	startButton.textContent = isMobile ? 'Start' : 'Start Conversation';
 	stopButton.textContent = isMobile ? 'Stop' : 'Stop Conversation';
 	clearChatButton.textContent = isMobile ? 'Clear' : 'Clear Chat';
-	currentMaxBarHeight = isMobile ? MAX_BAR_HEIGHT_MOBILE : MAX_BAR_HEIGHT_DESKTOP;
-};
+	maxBarHeight = isMobile ? MAX_BAR_HEIGHT_MOBILE : MAX_BAR_HEIGHT_DESKTOP;
+}
 
-window.addInitialMessage = function () {
-	messagesArea.innerHTML = ''; // c previous messages first
-	const messageBubble = document.createElement('div');
-	messageBubble.classList.add('message-bubble', 'ai-message');
-	const p = document.createElement('p');
-	p.textContent = INITIAL_MESSAGE;
-	messageBubble.appendChild(p);
-	messagesArea.appendChild(messageBubble);
-	messagesArea.scrollTop = messagesArea.scrollHeight;
-};
-
-window.addMessage = function (text, sender) {
-	const messageBubble = document.createElement('div');
-	messageBubble.classList.add('message-bubble', sender === 'user' ? 'user-message' : 'ai-message');
-	const p = document.createElement('p');
-	p.textContent = text;
-	messageBubble.appendChild(p);
-
-	if (sender === 'ai') {
-		setStatus('AI Speaking...');
-		// remove "thinking" indicator if AI speaks quickly
-		if (thinkingTimeoutId) clearTimeout(thinkingTimeoutId);
-		const existingThinkingIndicator = messageBubble.querySelector('.ai-speaking-indicator');
-		if (existingThinkingIndicator) existingThinkingIndicator.remove();
-	} else if (sender === 'user' && conversationActive) {
-		setStatus('Listening...');
-	}
-
-	messagesArea.appendChild(messageBubble);
-	messagesArea.scrollTop = messagesArea.scrollHeight;
-};
-
-window.showThinkingIndicator = function (show) {
-	if (show) {
-		setStatus('Processing...');
-	} else {
-		if (statusText.textContent === 'Processing...' && conversationActive) {
-			setStatus('Listening...');
+/**
+ * Render the transcript.
+ *
+ * The client streams an assistant reply by appending an empty message and then
+ * growing its text, so the last bubble is updated in place rather than being
+ * appended each time.
+ */
+const bubbles = [];
+export function renderTranscript(messages) {
+	messages.forEach((message, i) => {
+		let bubble = bubbles[i];
+		if (!bubble) {
+			bubble = document.createElement('div');
+			bubble.classList.add('message-bubble', message.role === 'user' ? 'user-message' : 'ai-message');
+			bubble.appendChild(document.createElement('p'));
+			messagesArea.appendChild(bubble);
+			bubbles[i] = bubble;
 		}
-	}
-};
-
-window.updateUserVoiceVisualization = function () {
-	if (!conversationActive) return;
-	voiceBars.forEach((bar) => {
-		const randomHeight = Math.floor(Math.random() * (currentMaxBarHeight - MIN_BAR_HEIGHT + 1)) + MIN_BAR_HEIGHT;
-		const randomOpacity = Math.random() * 0.4 + 0.6;
-		bar.style.height = `${randomHeight}px`;
-		bar.style.opacity = randomOpacity;
+		const p = bubble.firstChild;
+		if (p.textContent !== message.text) p.textContent = message.text;
 	});
-};
 
-window.handleStartConversation = async function () {
-	if (conversationActive) return;
+	// Drop any bubbles left over from a cleared conversation.
+	while (bubbles.length > messages.length) {
+		bubbles.pop().remove();
+	}
 
-	connectWebSocket();
+	messagesArea.scrollTop = messagesArea.scrollHeight;
+}
 
-	const vadReady = await initializeVADSystem();
-	if (!vadReady) {
-		// ui state should reflect this, perhaps disable start button until refresh
-		startButton.disabled = false;
-		stopButton.disabled = true;
-		clearChatButton.disabled = false;
+/** Show the live partial transcript as a faded user bubble. */
+let interimBubble = null;
+export function setInterim(text) {
+	if (!text) {
+		interimBubble?.remove();
+		interimBubble = null;
 		return;
 	}
-
-	conversationActive = true;
-	startButton.disabled = true;
-	stopButton.disabled = false;
-	clearChatButton.disabled = true;
-
-	voiceVisualizationArea.style.display = 'flex';
-	if (visualizationIntervalId) clearInterval(visualizationIntervalId);
-	visualizationIntervalId = setInterval(updateUserVoiceVisualization, 120);
-
-	if (messagesArea.children.length <= 1 && messagesArea.textContent.includes(INITIAL_MESSAGE.substring(0, 10))) {
-		messagesArea.innerHTML = '';
-		addMessage('Conversation started.', 'ai');
-	} else {
-		addMessage('Conversation resumed.', 'ai');
+	if (!interimBubble) {
+		interimBubble = document.createElement('div');
+		interimBubble.classList.add('message-bubble', 'user-message');
+		interimBubble.style.opacity = '0.55';
+		interimBubble.appendChild(document.createElement('p'));
+		messagesArea.appendChild(interimBubble);
 	}
-	setStatus('Listening...');
-};
+	interimBubble.firstChild.textContent = text;
+	messagesArea.scrollTop = messagesArea.scrollHeight;
+}
 
-window.handleStopConversation = function () {
-	if (!conversationActive && !vadInitialized) return;
+export function clearMessages() {
+	interimBubble = null;
+	bubbles.length = 0;
+	messagesArea.innerHTML = '';
+}
 
-	conversationActive = false;
-	// disable mic
-	window.stream.getTracks().forEach((track) => {
-		if (track.readyState == 'live') track.enabled = false;
+export function showNotice(text) {
+	const bubble = document.createElement('div');
+	bubble.classList.add('message-bubble', 'ai-message');
+	bubble.style.opacity = '0.7';
+	const p = document.createElement('p');
+	p.textContent = text;
+	bubble.appendChild(p);
+	messagesArea.appendChild(bubble);
+	messagesArea.scrollTop = messagesArea.scrollHeight;
+}
+
+/** Drive the bars from the real mic RMS reported by the voice client. */
+export function setAudioLevel(level) {
+	const normalized = Math.min(1, Math.max(0, level) * LEVEL_GAIN);
+	voiceBars.forEach((bar, i) => {
+		const weight = BAR_WEIGHTS[i % BAR_WEIGHTS.length];
+		const height = MIN_BAR_HEIGHT + (maxBarHeight - MIN_BAR_HEIGHT) * normalized * weight;
+		bar.style.height = `${Math.round(height)}px`;
+		bar.style.opacity = 0.5 + normalized * 0.5;
 	});
+}
 
-	if (vadInitialized) {
-		// only add "Conversation ended" if VAD was actually running
-		addMessage('Conversation ended.', 'ai');
-		setStatus('Ended. Click Start to resume.');
-	} else {
-		setStatus('Ready. Click Start.');
-	}
-
-	startButton.disabled = false;
-	stopButton.disabled = true;
-	clearChatButton.disabled = false;
-
-	clearInterval(visualizationIntervalId);
-	visualizationIntervalId = null;
+export function resetAudioLevel() {
 	voiceBars.forEach((bar) => {
 		bar.style.height = `${MIN_BAR_HEIGHT}px`;
 		bar.style.opacity = '0.5';
 	});
-	setTimeout(() => {
-		if (!conversationActive) voiceVisualizationArea.style.display = 'none';
-	}, 200);
+}
 
-	stopPlaying();
-};
+export function setVisualizerVisible(visible) {
+	voiceVisualizationArea.style.display = visible ? 'flex' : 'none';
+}
 
-window.handleClearChat = function () {
-	messagesArea.innerHTML = '';
-	addInitialMessage();
-	setStatus(`Chat cleared. Click "${startButton.textContent}" to begin.`);
+export function setControls({ inCall, connected }) {
+	startButton.disabled = inCall || !connected;
+	stopButton.disabled = !inCall;
+	clearChatButton.disabled = !connected;
+}
 
-	if (conversationActive) {
-		// if conversation was active, stop it gracefully
-		handleStopConversation();
-	} else {
-		// ensure buttons are in correct state if chat is cleared while inactive
-		startButton.disabled = false;
-		stopButton.disabled = true;
-		clearChatButton.disabled = false;
-		voiceVisualizationArea.style.display = 'none';
-	}
-	stopPlaying();
-	socket.send(JSON.stringify({ type: 'cmd', data: 'clear' }));
-};
-
-// init
-updateButtonText(); // set initial button text based on screen size
+updateButtonText();
 window.addEventListener('resize', updateButtonText);
-
-addInitialMessage();
-voiceVisualizationArea.style.display = 'none';
-stopButton.disabled = true;
-startButton.disabled = false;
-clearChatButton.disabled = false;
-messagesArea.scrollTop = messagesArea.scrollHeight;
-
-startButton.addEventListener('click', handleStartConversation);
-stopButton.addEventListener('click', handleStopConversation);
-clearChatButton.addEventListener('click', handleClearChat);
+setVisualizerVisible(false);
+resetAudioLevel();

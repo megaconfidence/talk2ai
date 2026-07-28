@@ -1,19 +1,29 @@
 # talk2ai
 
-This is a real-time voice-based chat application that allows users to have spoken conversations with an AI built from first principles. The application uses client-side Voice Activity Detection (VAD) to capture user speech, Cloudflare Workers for backend processing, and Cloudflare AI for Speech-to-Text (STT), Large Language Model (LLM) inference, and Text-to-Speech (TTS).
+This is a real-time voice-based chat application that allows users to have spoken conversations with an AI. It runs entirely on Cloudflare: the [`@cloudflare/voice`](https://developers.cloudflare.com/agents/communication-channels/voice/) Agents SDK handles the voice pipeline, and Workers AI provides Speech-to-Text (STT), Large Language Model (LLM) inference, and Text-to-Speech (TTS).
 
 [🚀🚀🚀 Live Demo](https://talk2ai.conflare.workers.dev/)
 
+## 🚀 Deploy your own
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/megaconfidence/talk2ai)
+
+One click clones this repo into your own GitHub account, provisions the Durable Object and Workers AI bindings, and deploys. There are no secrets or API keys to configure — Workers AI is a binding, and STT, LLM, and TTS all run on it.
+
+It runs on the **Workers Free plan**. See [A note on cost](#-a-note-on-cost) for what the free daily allowance buys you.
+
+> Your first deploy logs a `stale_tombstone` notice for `MyDurableObject`. That is expected — it retires a class from this project's pre-Agents-SDK version, and it does not exist on a new account. Delete that entry from `exports` in `wrangler.jsonc` to silence it.
 
 ## ✨ Features
 
 - **Real-time Voice Interaction:** Speak directly to the AI and hear its responses.
-- **Client-Side VAD:** Efficiently detects speech, sending audio only when the user is talking.
-- **Streaming AI Responses:** AI responses are streamed back for a more interactive feel.
-- **Cloudflare Powered:** Leverages Cloudflare Workers for scalable backend logic and Cloudflare AI for cutting-edge AI models.
-- **Chat History:** Maintains a conversation history within a session.
-- **Simple UI:** Clean interface displaying the conversation and providing controls.
+- **Model-Driven Turn Detection:** Deepgram Flux detects end-of-turn server-side, so there is no browser VAD, ONNX runtime, or WAV encoding to ship.
+- **Streaming AI Responses:** Replies are sentence-chunked and synthesized as they stream, so the AI starts speaking before it finishes thinking.
+- **True Barge-In:** Talking over the AI aborts LLM generation and TTS server-side via an `AbortSignal`, instead of only muting local playback.
+- **Persistent Chat History:** Conversation turns are stored in the Durable Object's SQLite database and survive reconnects.
+- **Live Transcription:** Partial transcripts render as you speak.
+- **Free-Plan Friendly:** SQLite-backed Durable Objects keep it inside the Workers Free plan's limits.
+- **No Build Step:** The frontend is plain ES modules; the voice client loads from a CDN.
 
 ## 🚀 How It Works
 
@@ -26,27 +36,20 @@ The application facilitates a voice conversation between a user and an AI throug
 
 ### Frontend (Client-Side)
 
-1.  **User Interaction & Permissions:**
-    - The user clicks the "Start Conversation" button.
-    - The browser requests microphone access.
-2.  **Voice Activity Detection (VAD):**
-    - Once permission is granted, the client-side VAD system is initialized.
-    - The VAD listens to the microphone input. When the user speaks, it captures audio.
-    - It processes the speech into audio chunks (ArrayBuffers).
-3.  **WebSocket Connection:**
-    - A WebSocket connection is established with the backend Cloudflare Worker.
-4.  **Sending Audio:**
-    - The captured audio chunks are sent directly to the backend via the WebSocket.
-    - Any currently playing AI audio is stopped before sending new user audio.
-5.  **Receiving & Displaying Messages:**
-    - The frontend listens for messages from the WebSocket:
-      - **`text` type:** This is the user's speech transcribed by the backend. It's displayed in the chat UI as a user message.
-      - **`audio` type:** This is the AI's response. The `text` content is displayed as an AI message, and the accompanying `audio` data is queued and played back to the user.
-    - The UI updates status messages (e.g., "Listening...", "AI Speaking...", "Processing...").
-    - A visualizer provides feedback when the user is speaking.
-6.  **Controls:**
-_ **Start/Stop Conversation:** Manages the VAD, WebSocket activity, and UI state.
-_ **Clear Chat:** Clears the displayed messages and sends a `clear` command to the backend to reset the conversation history for the session.
+The frontend uses `VoiceClient` from `@cloudflare/voice/client`, loaded as an ES module from a CDN so the project keeps its zero-build-step setup.
+
+1.  **Connection:** `client.connect()` opens a reconnecting WebSocket to the `VoiceAgent` Durable Object.
+2.  **Starting a Call:** Clicking "Start" calls `client.startCall()`, which requests microphone access and streams 16 kHz mono PCM to the agent as binary frames. The client owns mic capture, playback, and interrupt detection.
+3.  **Rendering:** The client exposes reactive state that the UI subscribes to:
+    - `transcriptchange` — the full conversation. Assistant replies arrive as an empty message that grows via deltas, so the last bubble is updated in place.
+    - `interimtranscript` — the live partial transcript of what you are currently saying.
+    - `statuschange` — `idle` / `listening` / `thinking` / `speaking`.
+    - `audiolevelchange` — real mic RMS (0–1), which drives the visualizer bars.
+    - `metricschange` — per-turn latency breakdown, logged to the console.
+4.  **Controls:**
+    - **Start / Stop:** `client.startCall()` and `client.endCall()`.
+    - **Clear Chat:** Sends `{ type: 'clear' }` to the agent, which deletes the persisted history.
+
 </details>
 
 <details>
@@ -54,41 +57,25 @@ _ **Clear Chat:** Clears the displayed messages and sends a `clear` command to t
 
 ### Backend (Cloudflare Worker with Durable Object)
 
-The backend is built using a Cloudflare Worker that utilizes a Durable Object to manage the state for each WebSocket connection (i.e., each user session).
+The backend is an Agent (a SQLite-backed Durable Object) with the `withVoice` mixin applied. The mixin owns the pipeline; the app only supplies providers and an `onTurn` handler.
 
-1.  **WebSocket Handshake:**
-    - When the frontend attempts to connect to `/websocket`, the main Worker `fetch` handler upgrades the HTTP request to a WebSocket connection.
-    - It gets or creates a unique Durable Object instance (using `idFromName(crypto.randomUUID())`) to handle this specific WebSocket connection.
-2.  **Receiving User Audio & Commands:**
-    - The Durable Object's WebSocket event listener receives messages from the client.
-    - If the message is a **stringified JSON command** (e.g., `{ "type": "cmd", "data": "clear" }`), it processes the command (e.g., clears `this.msgHistory`).
-    - If the message is an **audio buffer** (user's speech):
-3.  **Speech-to-Text (STT):**
-    - The audio buffer (an `ArrayBuffer`) is converted to a `Uint8Array`.
-    - This array is sent to the Cloudflare AI STT model (`@cf/openai/whisper-tiny-en`).
-    - The model transcribes the audio to text.
-    - The transcribed text is sent back to the client via WebSocket (`{ type: 'text', text: user_transcription }`) so the user can see what the AI heard.
-    - The user's transcribed text is added to the `msgHistory` array for context (`{ role: 'user', content: text }`).
-4.  **Large Language Model (LLM) Inference:**
-    - The `msgHistory` (containing the conversation so far) is sent to the Cloudflare AI LLM (`@cf/meta/llama-4-scout-17b-16e-instruct`).
-    - A system prompt ("You in a voice conversation with the user") guides the LLM's behavior.
-    - The LLM generates a response as a text stream. `smoothStream()` is used for potentially smoother output.
-5.  **Text Buffering & Text-to-Speech (TTS):**
-    - The `bufferText` utility processes the LLM's text stream, breaking it into sentences (or manageable chunks).
-    - For each sentence:
-      - The sentence is added to `msgHistory` (`{ role: 'assistant', content: sentence }`).
-      - The sentence is sent to the Cloudflare AI TTS model (`@cf/myshell-ai/melotts`) using a `PQueue` to manage concurrency (one TTS request at a time for this session to ensure order).
-      - The TTS model converts the text sentence into audio data.
-6.  **Sending AI Response to Client:**
-    - The generated audio data (along with the corresponding text sentence) is sent back to the client via WebSocket (`{ type: 'audio', text: sentence, audio: audio_data }`).
-7.  **WebSocket Closure:** \* If the WebSocket connection closes, the Durable Object handles the closure.
+1.  **Routing:** `routeAgentRequest` handles the WebSocket upgrade and dispatches to the `VoiceAgent` class. Anything it does not claim falls through to the `ASSETS` binding.
+2.  **Providers** (`src/index.ts`):
+    - `transcriber` — `WorkersAIFluxSTT` (`@cf/deepgram/flux`). A single session lives for the whole call and fires an utterance when the model detects end-of-turn.
+    - `tts` — `WorkersAITTS` (`@cf/deepgram/aura-1`), the SDK default. See "A note on cost" below.
+3.  **Greeting:** `onCallStart` speaks a greeting, but only when there is no prior history, so reconnects resume silently.
+4.  **LLM Inference:** `onTurn` receives the transcript plus `context.messages` (history from SQLite) and returns `streamText(...).textStream` from `@cf/meta/llama-3.2-3b-instruct`. `context.signal` is passed as `abortSignal`, so a barge-in cancels generation rather than paying for tokens nobody hears.
+5.  **Sentence Chunking & TTS:** The mixin splits the token stream into sentences and synthesizes them in order.
+6.  **Markdown Stripping:** `beforeSynthesize` runs `stripMarkdown` so the TTS never reads `**` or bullet markers aloud, even when the model ignores the system prompt.
+7.  **Persistence:** Turns are written to SQLite. `historyLimit` caps how many are replayed into the model, which bounds the context window.
+
 </details>
 
 ### Data Flow Summary
 
-User Speech → VAD (Client) → Audio Chunk → WebSocket → Durable Object (Backend) → STT Model → User Text Transcript (to Client & LLM) → LLM → AI Text Response Stream → Sentence Buffer → TTS Model → AI Audio Chunk → WebSocket → Client (Play Audio & Display Text)
+User Speech → Mic PCM (Client) → WebSocket → Durable Object → Flux STT (turn detection) → Transcript (to Client & LLM) → Llama 3.2 3B Stream → Sentence Chunking → aura-1 TTS → Audio → WebSocket → Client (Play Audio & Display Text)
 
-## ⚙️ Setup & Running
+## ⚙️ Local development
 
 ```
 git clone https://github.com/megaconfidence/talk2ai
@@ -97,10 +84,55 @@ npm install
 npm run dev
 ```
 
+Workers AI has no local simulator, so `wrangler dev` proxies the `AI` binding to the real service and you need to be logged in (`npx wrangler login`). Deploy with `npm run deploy`.
+
+## 🧠 Model choice
+
+`@cf/meta/llama-3.2-3b-instruct`, picked by measuring rather than by parameter count.
+
+The metric that matters is **time to first *sentence***, not time to first token and not time to full completion. TTFT is dominated by round-trip and barely varies between models, while full completion is irrelevant because the pipeline chunks on sentence boundaries and starts synthesizing immediately. What the user actually waits for is the first sentence, plus TTS.
+
+Measured across every text-generation model on Workers AI, 12 samples each:
+
+| Model | Time to first sentence (p50) | + TTS = first audio |
+| --- | --- | --- |
+| **`llama-3.2-3b-instruct`** | **465 ms** | **~823 ms** |
+| `mistral-small-3.1-24b` | 663 ms | ~1021 ms |
+| `llama-3.2-1b-instruct` | 748 ms | ~1106 ms |
+| `granite-4.0-h-micro` | 951 ms | ~1309 ms |
+| `llama-4-scout-17b` | 1128 ms | ~1486 ms |
+| `llama-3.3-70b-fp8-fast` | 1333 ms | ~1691 ms |
+| `llama-3.1-8b-instruct-fp8` | 2774 ms | ~3132 ms |
+
+Two things worth knowing before you swap the model:
+
+**Avoid reasoning models.** `qwen3-30b-a3b`, `gemma-4-26b-a4b`, `gpt-oss-20b`, and `glm-4.7-flash` all stream `reasoning` deltas and return `content: null`, so the first audio is delayed by the entire thinking pass. The "flash" in `glm-4.7-flash` refers to the model family, not to latency.
+
+**Small models are weak on Cloudflare's own vocabulary.** Out of the box, 3B described a Durable Object as something that "retains its shape under stress", an R2 bucket as oilfield equipment, and KV as kilovolts. The last two lines of `SYSTEM_PROMPT` fix this for about 40 ms. Note the phrasing is deliberate: an earlier version that only established the Cloudflare context caused the model to refuse off-topic questions entirely ("that's not something we can discuss in the context of Cloudflare Workers"), which is why it explicitly grants permission to answer everything else.
+
+If you want stronger factual answers and can spend ~200 ms, `mistral-small-3.1-24b` was the most accurate model tested and needs no prompt patch. If free-plan runway matters more than latency, `granite-4.0-h-micro` is ~3x cheaper per token and far terser, which also cuts the TTS bill.
+
+## 💸 A note on cost
+
+Everything runs on Workers AI, so cost is measured in neurons — 10,000 free per day.
+
+Almost none of that goes on the LLM. Speech is the expensive part — and the STT half is charged by the clock, not by how much you say. Flux bills per audio minute of the **call**: the transcriber session streams continuously from `startCall` to `endCall`, so an open call with nobody talking still costs about 700 neurons a minute.
+
+Roughly, per minute of conversation:
+
+| Component | Neurons / min | Share |
+| --- | --- | --- |
+| Flux STT | ~700 | ~52% |
+| `aura-1` TTS | ~650 | ~48% |
+| `llama-3.2-3b` | ~18 | <2% |
+
+That works out to about **7 minutes of conversation per day** on the free plan. Ending calls promptly matters more than talking less.
+
 ## ⚠️ Known Issues & Limitations
 
-- **LLM Context Window:** The `msgHistory` grows with the conversation. Long conversations might exceed the LLM's context window or token limits.
-- **Error Handling:** While some error handling is present, more robust mechanisms could be added (e.g., WebSocket reconnection logic).
+- **Beta SDK:** `@cloudflare/voice` is in beta and its API may change.
+- **Free-Plan Ceiling:** About 7 minutes of conversation per day. Flux bills for the whole call, so an idle open call still costs ~700 neurons per minute.
+- **Local dev behind WARP:** With Cloudflare WARP and Gateway enabled, the `AI` binding may fail with `InferenceUpstreamError: 403` in `wrangler dev`, even though the same calls succeed over the REST API. Disconnecting WARP is the quickest workaround.
 
 ## 🤝 Contributing
 

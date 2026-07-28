@@ -1,99 +1,135 @@
-import { smoothStream, streamText } from 'ai';
-import { bufferText } from './utils';
-import { DurableObject } from 'cloudflare:workers';
+import { Agent, routeAgentRequest, type Connection } from 'agents';
+import { withVoice, WorkersAIFluxSTT, WorkersAITTS, type VoiceTurnContext } from '@cloudflare/voice';
+import { streamText } from 'ai';
 import { createWorkersAI } from 'workers-ai-provider';
-import PQueue from 'p-queue';
+import { stripMarkdown } from './utils';
 
-/* Todo
- * ✅ 1. WS with frontend
- * ✅ 2. Get audio to backend
- * ✅ 3. Convert audio to text
- * ✅ 4. Run inference
- * ✅ 5. Convert result to audio
- * ✅ 6. Send audio to frontend
+/**
+ * Chosen by measuring, not by parameter count. Against llama-4-scout on the
+ * same prompts: near-identical time-to-first-token (~250ms, dominated by
+ * round-trip), but ~2.7x faster to finish a reply (425ms vs 1134ms p50) and
+ * noticeably terser (26 vs 46 words on average) — which for a voice agent also
+ * means less audio to synthesize.
+ *
+ * Avoid reasoning models here (qwen3-a3b, gemma-4-a4b, gpt-oss). They emit
+ * `reasoning` deltas before any spoken content, so the first sentence — and
+ * therefore the first audio — is delayed by the entire thinking pass.
  */
+const LLM = '@cf/meta/llama-3.2-3b-instruct';
 
-export class MyDurableObject extends DurableObject {
-	env: Env;
-	msgHistory: Array<Object>;
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-		this.env = env;
-		this.msgHistory = [];
+const SYSTEM_PROMPT = [
+	'You are a helpful assistant in a spoken, real-time voice conversation.',
+	'',
+	'Your reply is read aloud by a text-to-speech engine, so:',
+	'- Reply in plain spoken prose. Never use Markdown, bullet points, numbered',
+	'  lists, headings, asterisks, or emoji — they get pronounced literally.',
+	'- Keep answers to one or two short sentences unless asked for detail.',
+	'- Write numbers, dates, and units the way a person would say them',
+	'  ("about twenty dollars", not "~$20").',
+	'- Never describe what you are doing, just answer.',
+	'',
+	'If a question is ambiguous, ask one short clarifying question.',
+	'',
+	// Without this the model reads the product names literally: it has described
+	// a Durable Object as something "that retains its shape under stress", an R2
+	// bucket as oilfield equipment, and KV as kilovolts. The second sentence is
+	// load-bearing — an earlier version that only mentioned Cloudflare made the
+	// model refuse off-topic questions ("that's not something we can discuss in
+	// the context of Cloudflare Workers").
+	'Workers, Durable Objects, R2, KV, D1, and Workers AI are Cloudflare developer',
+	'products, not physical objects. Answer questions on every other topic normally.',
+].join('\n');
+
+const GREETING = "Hi! I'm listening — what would you like to talk about?";
+
+/**
+ * The voice pipeline (STT -> turn detection -> LLM -> sentence chunking -> TTS
+ * -> playback) comes from the mixin. `historyLimit` caps how many prior
+ * messages are replayed into the model, which bounds the context window; the
+ * old hand-rolled version grew its history array forever.
+ */
+const VoiceAgentBase = withVoice(Agent, {
+	historyLimit: 12,
+	maxMessageCount: 200,
+});
+
+export class VoiceAgent extends VoiceAgentBase<Env> {
+	/**
+	 * Flux does end-of-turn detection server-side, which is what replaced the
+	 * browser-side Silero VAD, the ONNX runtime, and the hand-written WAV
+	 * encoder that used to live in public/vad/.
+	 */
+	transcriber = new WorkersAIFluxSTT(this.env.AI);
+
+	/**
+	 * Declared explicitly because `tts` has no implicit default — omit it and the
+	 * agent transcribes but never speaks.
+	 *
+	 * Pass `{ speaker: "..." }` to change voice; "asteria" is the default.
+	 */
+	tts = new WorkersAITTS(this.env.AI);
+
+	async onCallStart(connection: Connection) {
+		// Only greet a fresh conversation; a reconnect resumes silently so the
+		// user is not re-greeted mid-topic.
+		if (this.getConversationHistory(1).length > 0) return;
+		await this.speak(connection, GREETING);
 	}
-	async fetch(request: any) {
-		// set up ws pipeline
-		const webSocketPair = new WebSocketPair();
-		const [socket, ws] = Object.values(webSocketPair);
 
-		ws.accept();
+	beforeSynthesize(text: string) {
+		const spoken = stripMarkdown(text);
+		// Nothing pronounceable left (e.g. the model emitted only a bullet
+		// marker) — skip the TTS call instead of synthesizing silence.
+		return spoken.length > 0 ? spoken : null;
+	}
+
+	async onTurn(transcript: string, context: VoiceTurnContext) {
 		const workersai = createWorkersAI({ binding: this.env.AI });
-		const queue = new PQueue({ concurrency: 1 });
 
-		ws.addEventListener('message', async (event) => {
-			// handle chat commands
-			if (typeof event.data === 'string') {
-				const { type, data } = JSON.parse(event.data);
-				if (type === 'cmd' && data === 'clear') {
-					this.msgHistory.length = 0; // clear chat history
-				}
-				return; // end processing here for this event type
-			}
-
-			// transcribe audio buffer to text (stt)
-			const { text } = await this.env.AI.run('@cf/openai/whisper-tiny-en', {
-				audio: [...new Uint8Array(event.data as ArrayBuffer)],
-			});
-			console.log('>>', text);
-			ws.send(JSON.stringify({ type: 'text', text })); // send transcription to client
-			this.msgHistory.push({ role: 'user', content: text });
-
-			// run inference
-			const result = streamText({
-				model: workersai('@cf/meta/llama-4-scout-17b-16e-instruct' as any),
-				system: 'You in a voice conversation with the user',
-				messages: this.msgHistory as any,
-				// experimental_transform: smoothStream(),
-			});
-			// buffer streamed response into sentences, then convert to audio
-			await bufferText(result.textStream, async (sentence: string) => {
-				this.msgHistory.push({ role: 'assistant', content: sentence });
-				console.log('<<', sentence);
-				await queue.add(async () => {
-					// convert response to audio (tts)
-					const audio = await this.env.AI.run('@cf/myshell-ai/melotts' as any, {
-						prompt: sentence,
-						// lang: 'es'
-					});
-					ws.send(JSON.stringify({ type: 'audio', text: sentence, audio: audio.audio }));
-				});
-			});
+		const result = streamText({
+			model: workersai(LLM as Parameters<typeof workersai>[0]),
+			system: SYSTEM_PROMPT,
+			messages: [
+				...context.messages.map((m) => ({
+					role: m.role as 'user' | 'assistant',
+					content: m.content,
+				})),
+				{ role: 'user' as const, content: transcript },
+			],
+			// Aborted when the user talks over the reply. Without this the model
+			// keeps generating tokens nobody will hear, and every remaining
+			// sentence still gets synthesized and billed.
+			abortSignal: context.signal,
 		});
 
-		ws.addEventListener('close', (cls) => {
-			ws.close(cls.code, 'Durable Object is closing WebSocket');
-		});
+		return result.textStream;
+	}
 
-		return new Response(null, { status: 101, webSocket: socket });
+	/**
+	 * App-level messages that are not part of the voice protocol. The voice
+	 * mixin forwards anything it does not recognise here.
+	 */
+	async onMessage(connection: Connection, message: string | ArrayBuffer) {
+		if (typeof message !== 'string') return;
+
+		let payload: { type?: string };
+		try {
+			payload = JSON.parse(message);
+		} catch {
+			return;
+		}
+
+		if (payload.type === 'clear') {
+			// The mixin persists turns to this table; there is no public API to
+			// reset it, so clear it directly through the Agent's SQL handle.
+			this.sql`DELETE FROM cf_voice_messages`;
+			connection.send(JSON.stringify({ type: 'cleared' }));
+		}
 	}
 }
 
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
-		if (request.url.endsWith('/websocket')) {
-			const upgradeHeader = request.headers.get('Upgrade');
-			if (!upgradeHeader || upgradeHeader !== 'websocket') {
-				return new Response('Expected upgrade to websocket', { status: 426 });
-			}
-			let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(crypto.randomUUID());
-			let stub = env.MY_DURABLE_OBJECT.get(id);
-			return stub.fetch(request);
-		}
-
-		return new Response(null, {
-			status: 400,
-			statusText: 'Bad Request',
-			headers: { 'Content-Type': 'text/plain' },
-		});
+	async fetch(request, env): Promise<Response> {
+		return (await routeAgentRequest(request, env)) ?? env.ASSETS.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;

@@ -1,27 +1,38 @@
-export async function bufferText(textStream: ReadableStream, callBack: (sentence: string) => void) {
-	let wordBuffer = '';
-	let timeoutId;
-	for await (const word of textStream) {
-		if (timeoutId) clearTimeout(timeoutId);
-		wordBuffer += word;
-
-		// Match sentences ending with ., !, or ? followed by a space or end of string
-		const sentenceRegex = /([^\r\n.?!]*[.?!])(\s|$)/g;
-		let match;
-		let lastIndex = 0;
-
-		while ((match = sentenceRegex.exec(wordBuffer)) !== null) {
-			const sentence = wordBuffer.slice(lastIndex, sentenceRegex.lastIndex).trim();
-			if (sentence) callBack(sentence);
-			lastIndex = sentenceRegex.lastIndex;
-		}
-
-		// Keep only the unfinished part in the wordBuffer
-		wordBuffer = wordBuffer.slice(lastIndex);
-
-		// Set a timer to process last buffer if no new word comes
-		timeoutId = setTimeout(() => {
-			if (wordBuffer) callBack(wordBuffer);
-		}, 1000);
-	}
+/**
+ * Strip Markdown syntax so TTS does not read punctuation aloud.
+ *
+ * The system prompt already asks the model for plain speech, but prompts leak —
+ * models slip back into bullet lists and bold text, and the voice then says
+ * "star star important star star". This runs in `beforeSynthesize` so the
+ * spoken audio is clean regardless of what the model returns. The transcript
+ * shown in the UI keeps the original text.
+ */
+export function stripMarkdown(text: string): string {
+	return (
+		text
+			// Fenced code blocks -> their contents
+			.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, '$1')
+			// Inline code
+			.replace(/`([^`]+)`/g, '$1')
+			// Images -> alt text, before links so the leading ! is consumed
+			.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+			// Links -> label
+			.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+			// Bold / italic / strikethrough
+			.replace(/(\*\*|__)(.*?)\1/g, '$2')
+			.replace(/(\*|_)(.*?)\1/g, '$2')
+			.replace(/~~(.*?)~~/g, '$1')
+			// ATX headings
+			.replace(/^#{1,6}\s+/gm, '')
+			// Blockquotes
+			.replace(/^\s*>\s?/gm, '')
+			// Unordered list markers
+			.replace(/^\s*[-*+]\s+/gm, '')
+			// Horizontal rules
+			.replace(/^\s*([-*_])\s*(?:\1\s*){2,}$/gm, '')
+			// Collapse the whitespace the substitutions leave behind
+			.replace(/[ \t]{2,}/g, ' ')
+			.replace(/\n{3,}/g, '\n\n')
+			.trim()
+	);
 }
