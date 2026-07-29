@@ -1,0 +1,23 @@
+package-lock.json
+  s_eb0254e369e5c1::t_b0937dda3d9828 2832
+public/index.html
+  s_eb0254e369e5c1::t_08ad5c05aa78c6 1-19,21-881,884
+src/index.ts
+  s_eb0254e369e5c1::t_fe16350747f7a6 84-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e3c7b5a35740a9bf520adc567612da096a2908ce",
+  "prompts": {},
+  "sessions": {
+    "s_eb0254e369e5c1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_056e10124ffeScxoo1FFfyiDUU",
+        "model": "claude-opus-5"
+      },
+      "human_author": "megaconfidence <cokoghenun@gmail.com>"
+    }
+  }
+}
