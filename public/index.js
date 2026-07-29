@@ -6,7 +6,9 @@ import {
 	resetAudioLevel,
 	setAudioLevel,
 	setControls,
+	setError,
 	setInterim,
+	setPhase,
 	setStatus,
 	setVisualizerVisible,
 	showNotice,
@@ -14,11 +16,12 @@ import {
 
 const { startButton, stopButton, clearChatButton } = buttons;
 
+// No trailing ellipses — CSS animates its own for the "thinking" phase.
 const STATUS_LABEL = {
-	idle: 'Idle. Click Start to talk.',
-	listening: 'Listening...',
-	thinking: 'Thinking...',
-	speaking: 'AI speaking...',
+	idle: 'Ready to talk',
+	listening: 'Listening',
+	thinking: 'Thinking',
+	speaking: 'Speaking',
 };
 
 /**
@@ -40,13 +43,14 @@ function syncControls() {
 
 client.addEventListener('connectionchange', (isConnected) => {
 	connected = isConnected;
-	if (!isConnected) setStatus('Reconnecting...');
+	if (!isConnected) setStatus('Reconnecting');
 	else if (!inCall) setStatus(STATUS_LABEL.idle);
 	syncControls();
 });
 
 client.addEventListener('statuschange', (status) => {
 	inCall = status !== 'idle';
+	setPhase(status);
 	setStatus(STATUS_LABEL[status] ?? status);
 	setVisualizerVisible(inCall);
 	if (!inCall) resetAudioLevel();
@@ -64,7 +68,7 @@ client.addEventListener('audiolevelchange', (level) => {
 });
 
 client.addEventListener('error', (message) => {
-	if (message) setStatus(`Error: ${message}`);
+	if (message) setError(message);
 });
 
 // Latency breakdown per turn — the hand-rolled pipeline had no visibility here.
@@ -77,7 +81,7 @@ startButton.addEventListener('click', async () => {
 		await client.startCall();
 	} catch (error) {
 		console.error('Failed to start call:', error);
-		setStatus('Could not access the microphone.');
+		setError('Could not access the microphone');
 	}
 });
 
@@ -88,9 +92,9 @@ clearChatButton.addEventListener('click', () => {
 	clearOffset = client.transcript.length;
 	clearMessages();
 	setInterim(null);
-	showNotice('Chat cleared. Click Start to begin.');
+	showNotice('Chat cleared');
 });
 
-setStatus('Connecting...');
+setStatus('Connecting');
 syncControls();
 client.connect();

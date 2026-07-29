@@ -1,21 +1,17 @@
+const root = document.documentElement;
 const statusText = document.getElementById('statusText');
+const callTimer = document.getElementById('callTimer');
+const connPill = document.getElementById('connPill');
+const connLabel = document.getElementById('connLabel');
 const startButton = document.getElementById('startButton');
 const stopButton = document.getElementById('stopButton');
 const clearChatButton = document.getElementById('clearChatButton');
 const messagesArea = document.getElementById('messagesArea');
 const voiceVisualizationArea = document.getElementById('voiceVisualizationArea');
-const voiceBars = Array.from(voiceVisualizationArea.querySelectorAll('.voice-bar'));
+const voiceBars = document.getElementById('voiceBars');
 
-const MIN_BAR_HEIGHT = 5;
-const MAX_BAR_HEIGHT_MOBILE = 30;
-const MAX_BAR_HEIGHT_DESKTOP = 40;
-// Speech RMS sits well below 1.0, so scale it up before mapping to pixels.
+// Speech RMS sits well below 1.0, so scale it up before mapping to the bars.
 const LEVEL_GAIN = 3;
-// Middle bars peak highest, which reads as an equaliser rather than a row of
-// identical blocks. Purely cosmetic — the input is a real measurement.
-const BAR_WEIGHTS = [0.55, 0.8, 1, 0.8, 0.55];
-
-let maxBarHeight = MAX_BAR_HEIGHT_MOBILE;
 
 export const buttons = { startButton, stopButton, clearChatButton };
 
@@ -23,12 +19,18 @@ export function setStatus(text) {
 	statusText.textContent = text;
 }
 
-export function updateButtonText() {
-	const isMobile = window.innerWidth < 640;
-	startButton.textContent = isMobile ? 'Start' : 'Start Conversation';
-	stopButton.textContent = isMobile ? 'Stop' : 'Stop Conversation';
-	clearChatButton.textContent = isMobile ? 'Clear' : 'Clear Chat';
-	maxBarHeight = isMobile ? MAX_BAR_HEIGHT_MOBILE : MAX_BAR_HEIGHT_DESKTOP;
+/**
+ * Reflect the call phase ('idle' | 'listening' | 'thinking' | 'speaking' |
+ * 'error') on the root element. CSS keys the accent colour, the status dot and
+ * the thinking ellipsis off this, so the JS never has to touch presentation.
+ */
+export function setPhase(phase) {
+	root.dataset.phase = phase;
+}
+
+export function setError(message) {
+	setPhase('error');
+	setStatus(message);
 }
 
 /**
@@ -58,10 +60,10 @@ export function renderTranscript(messages) {
 		bubbles.pop().remove();
 	}
 
-	messagesArea.scrollTop = messagesArea.scrollHeight;
+	scrollToLatest();
 }
 
-/** Show the live partial transcript as a faded user bubble. */
+/** Show the live partial transcript as a provisional user bubble. */
 let interimBubble = null;
 export function setInterim(text) {
 	if (!text) {
@@ -71,61 +73,91 @@ export function setInterim(text) {
 	}
 	if (!interimBubble) {
 		interimBubble = document.createElement('div');
-		interimBubble.classList.add('message-bubble', 'user-message');
-		interimBubble.style.opacity = '0.55';
+		interimBubble.classList.add('message-bubble', 'user-message', 'is-interim');
 		interimBubble.appendChild(document.createElement('p'));
 		messagesArea.appendChild(interimBubble);
 	}
 	interimBubble.firstChild.textContent = text;
-	messagesArea.scrollTop = messagesArea.scrollHeight;
+	scrollToLatest();
 }
 
 export function clearMessages() {
 	interimBubble = null;
 	bubbles.length = 0;
-	messagesArea.innerHTML = '';
+	messagesArea.replaceChildren();
 }
 
+/** A centred pill for things neither party said, e.g. "chat cleared". */
 export function showNotice(text) {
 	const bubble = document.createElement('div');
-	bubble.classList.add('message-bubble', 'ai-message');
-	bubble.style.opacity = '0.7';
+	bubble.classList.add('message-bubble', 'is-notice');
 	const p = document.createElement('p');
 	p.textContent = text;
 	bubble.appendChild(p);
 	messagesArea.appendChild(bubble);
+	scrollToLatest();
+}
+
+function scrollToLatest() {
 	messagesArea.scrollTop = messagesArea.scrollHeight;
 }
 
-/** Drive the bars from the real mic RMS reported by the voice client. */
+/**
+ * Drive the bars from the real mic RMS reported by the voice client.
+ *
+ * Only a single custom property changes per frame; CSS scales each bar by its
+ * own `--w` weight, so the equaliser shape and sizing stay in the stylesheet.
+ */
 export function setAudioLevel(level) {
 	const normalized = Math.min(1, Math.max(0, level) * LEVEL_GAIN);
-	voiceBars.forEach((bar, i) => {
-		const weight = BAR_WEIGHTS[i % BAR_WEIGHTS.length];
-		const height = MIN_BAR_HEIGHT + (maxBarHeight - MIN_BAR_HEIGHT) * normalized * weight;
-		bar.style.height = `${Math.round(height)}px`;
-		bar.style.opacity = 0.5 + normalized * 0.5;
-	});
+	voiceBars.style.setProperty('--level', normalized.toFixed(3));
 }
 
 export function resetAudioLevel() {
-	voiceBars.forEach((bar) => {
-		bar.style.height = `${MIN_BAR_HEIGHT}px`;
-		bar.style.opacity = '0.5';
-	});
+	voiceBars.style.setProperty('--level', '0');
 }
 
+/** Kept mounted at a flat baseline when inactive, so nothing reflows. */
 export function setVisualizerVisible(visible) {
-	voiceVisualizationArea.style.display = visible ? 'flex' : 'none';
+	voiceVisualizationArea.dataset.active = visible ? 'true' : 'false';
+}
+
+let timerId = null;
+let callStartedAt = 0;
+
+function tickTimer() {
+	const seconds = Math.floor((Date.now() - callStartedAt) / 1000);
+	callTimer.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Flux bills for wall-clock call duration, not words spoken, so surfacing how
+ * long the mic has been open is a cost signal rather than decoration.
+ */
+function setTimerRunning(running) {
+	if (running === Boolean(timerId)) return;
+	if (running) {
+		callStartedAt = Date.now();
+		tickTimer();
+		timerId = setInterval(tickTimer, 1000);
+	} else {
+		clearInterval(timerId);
+		timerId = null;
+		callTimer.textContent = '0:00';
+	}
 }
 
 export function setControls({ inCall, connected }) {
 	startButton.disabled = inCall || !connected;
 	stopButton.disabled = !inCall;
 	clearChatButton.disabled = !connected;
+
+	root.dataset.call = inCall ? 'active' : 'idle';
+	connPill.dataset.online = connected ? 'true' : 'false';
+	connLabel.textContent = connected ? 'Connected' : 'Connecting';
+
+	setTimerRunning(inCall);
 }
 
-updateButtonText();
-window.addEventListener('resize', updateButtonText);
 setVisualizerVisible(false);
 resetAudioLevel();

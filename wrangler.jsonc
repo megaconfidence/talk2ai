@@ -23,16 +23,6 @@
 	 * gets provisioned.
 	 */
 	"exports": {
-		/**
-		 * Tombstone retiring the pre-Agents-SDK class. Needed on the original
-		 * deployment, where that namespace still exists; on a fresh account it is
-		 * a no-op that logs a harmless `stale_tombstone` notice, which you can
-		 * silence by deleting this entry after your first deploy.
-		 */
-		"MyDurableObject": {
-			"state": "deleted",
-			"type": "durable-object",
-		},
 		"VoiceAgent": {
 			"storage": "sqlite",
 			"type": "durable-object",

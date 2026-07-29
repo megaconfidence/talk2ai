@@ -12,8 +12,6 @@ One click clones this repo into your own GitHub account, provisions the Durable 
 
 It runs on the **Workers Free plan**. See [A note on cost](#-a-note-on-cost) for what the free daily allowance buys you.
 
-> Your first deploy logs a `stale_tombstone` notice for `MyDurableObject`. That is expected — it retires a class from this project's pre-Agents-SDK version, and it does not exist on a new account. Delete that entry from `exports` in `wrangler.jsonc` to silence it.
-
 ## ✨ Features
 
 - **Real-time Voice Interaction:** Speak directly to the AI and hear its responses.
@@ -64,7 +62,7 @@ The backend is an Agent (a SQLite-backed Durable Object) with the `withVoice` mi
     - `transcriber` — `WorkersAIFluxSTT` (`@cf/deepgram/flux`). A single session lives for the whole call and fires an utterance when the model detects end-of-turn.
     - `tts` — `WorkersAITTS` (`@cf/deepgram/aura-1`), the SDK default. See "A note on cost" below.
 3.  **Greeting:** `onCallStart` speaks a greeting, but only when there is no prior history, so reconnects resume silently.
-4.  **LLM Inference:** `onTurn` receives the transcript plus `context.messages` (history from SQLite) and returns `streamText(...).textStream` from `@cf/meta/llama-3.2-3b-instruct`. `context.signal` is passed as `abortSignal`, so a barge-in cancels generation rather than paying for tokens nobody hears.
+4.  **LLM Inference:** `onTurn` returns the streaming `env.AI.run()` response for `@cf/meta/llama-3.2-3b-instruct` directly — `context.messages` (history from SQLite) already includes the current turn. `context.signal` is passed as the binding's `signal`, so a barge-in cancels generation rather than paying for tokens nobody hears. The raw stream is handed to the voice mixin unparsed on purpose; see the comment on `onTurn` for why the AI SDK provider is bypassed.
 5.  **Sentence Chunking & TTS:** The mixin splits the token stream into sentences and synthesizes them in order.
 6.  **Markdown Stripping:** `beforeSynthesize` runs `stripMarkdown` so the TTS never reads `**` or bullet markers aloud, even when the model ignores the system prompt.
 7.  **Persistence:** Turns are written to SQLite. `historyLimit` caps how many are replayed into the model, which bounds the context window.

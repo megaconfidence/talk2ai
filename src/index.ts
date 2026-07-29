@@ -1,7 +1,5 @@
 import { Agent, routeAgentRequest, type Connection } from 'agents';
 import { withVoice, WorkersAIFluxSTT, WorkersAITTS, type VoiceTurnContext } from '@cloudflare/voice';
-import { streamText } from 'ai';
-import { createWorkersAI } from 'workers-ai-provider';
 import { stripMarkdown } from './utils';
 
 /**
@@ -83,26 +81,42 @@ export class VoiceAgent extends VoiceAgentBase<Env> {
 		return spoken.length > 0 ? spoken : null;
 	}
 
-	async onTurn(transcript: string, context: VoiceTurnContext) {
-		const workersai = createWorkersAI({ binding: this.env.AI });
-
-		const result = streamText({
-			model: workersai(LLM as Parameters<typeof workersai>[0]),
-			system: SYSTEM_PROMPT,
-			messages: [
-				...context.messages.map((m) => ({
-					role: m.role as 'user' | 'assistant',
-					content: m.content,
-				})),
-				{ role: 'user' as const, content: transcript },
-			],
-			// Aborted when the user talks over the reply. Without this the model
-			// keeps generating tokens nobody will hear, and every remaining
-			// sentence still gets synthesized and billed.
-			abortSignal: context.signal,
-		});
-
-		return result.textStream;
+	/**
+	 * Returns the raw streaming binding response. The voice mixin accepts a
+	 * `ReadableStream<Uint8Array>` and parses the SSE itself.
+	 *
+	 * Deliberately NOT `streamText()` from the AI SDK via `workers-ai-provider`.
+	 * Workers AI emits both response shapes in every chunk:
+	 *
+	 *   data: {"choices":[{"delta":{"content":"I"}}], ..., "response":"I", ...}
+	 *
+	 * and that provider's SSE mapper tests the two shapes in independent `if`
+	 * branches (`streaming.ts`: `if (nativeResponse…)` then `if (choices?.[0]…)`),
+	 * so it emits a `text-delta` for each — every token twice. Replayed through
+	 * the real captured stream that turns "I think I have gotten confused." into
+	 * "II think think I I have have gotten gotten confused confused..", in the
+	 * transcript and the audio alike. The mixin's own parser uses `else if`, so
+	 * handing it the unparsed stream takes exactly one copy.
+	 *
+	 * Bug is present in workers-ai-provider 4.0.0 (latest at time of writing);
+	 * revisit if a release fixes the mapper.
+	 *
+	 * `context.messages` is the full history *including* the current turn — the
+	 * mixin calls `saveMessage("user", …)` before `getConversationHistory()` — so
+	 * `transcript` must not be appended again. Doing so (as the upstream README
+	 * example does) sends two identical consecutive user turns.
+	 */
+	async onTurn(_transcript: string, context: VoiceTurnContext) {
+		return this.env.AI.run(
+			LLM,
+			{
+				stream: true,
+				messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...context.messages.map((m) => ({ role: m.role, content: m.content }))],
+			},
+			// Barge-in: aborted when the user talks over the reply, which cancels
+			// the inference instead of billing for tokens nobody will hear.
+			{ signal: context.signal },
+		);
 	}
 
 	/**
