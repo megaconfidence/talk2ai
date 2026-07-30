@@ -2,7 +2,7 @@
 
 This is a real-time voice-based chat application that allows users to have spoken conversations with an AI. It runs entirely on Cloudflare: the [`@cloudflare/voice`](https://developers.cloudflare.com/agents/communication-channels/voice/) Agents SDK handles the voice pipeline, and Workers AI provides Speech-to-Text (STT), Large Language Model (LLM) inference, and Text-to-Speech (TTS).
 
-[🚀🚀🚀 Live Demo](https://talk2ai.conflare.workers.dev/)
+[🚀🚀🚀 Live Demo](https://talk2ai.conflaree.workers.dev/)
 
 ## 🚀 Deploy your own
 
