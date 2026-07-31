@@ -1,5 +1,5 @@
 import { Agent, routeAgentRequest, type Connection } from 'agents';
-import { withVoice, WorkersAIFluxSTT, WorkersAITTS, type VoiceTurnContext } from '@cloudflare/voice';
+import { withVoice, WorkersAINova3STT, WorkersAITTS, type VoiceTurnContext } from '@cloudflare/voice';
 import { stripMarkdown } from './utils';
 
 /**
@@ -53,11 +53,11 @@ const VoiceAgentBase = withVoice(Agent, {
 
 export class VoiceAgent extends VoiceAgentBase<Env> {
 	/**
-	 * Flux does end-of-turn detection server-side, which is what replaced the
+	 * Nova-3 does endpointing server-side, which is what replaced the
 	 * browser-side Silero VAD, the ONNX runtime, and the hand-written WAV
 	 * encoder that used to live in public/vad/.
 	 */
-	transcriber = new WorkersAIFluxSTT(this.env.AI);
+	transcriber = new WorkersAINova3STT(this.env.AI);
 
 	/**
 	 * Declared explicitly because `tts` has no implicit default — omit it and the
